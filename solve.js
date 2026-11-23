@@ -7,9 +7,36 @@
 
 const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 
+/** `text` with & < > " and ' escaped: the reference's result, built from slices between specials. */
+function escapeHtmlRaw(text) {
+  const re = ESC_SCAN;
+  re.lastIndex = 0;
+  let m;
+  let last = 0;
+  let out = null;
+  while ((m = re.exec(text)) !== null) {
+    if (out === null) out = [];
+    if (m.index > last) out.push(text.slice(last, m.index));
+    out.push(ESCAPES[m[0]]);
+    last = m.index + 1;
+  }
+  if (out === null) return text;
+  if (last < text.length) out.push(text.slice(last));
+  return out.join('');
+}
+
+// Per-build memo for escaped values: the same titles, excerpts and urls are escaped again on
+// every page that lists them. Reset in build(); bounded to short strings.
+let escCache = new Map();
+
 /** `text` with & < > " and ' escaped (the reference's regex replace, unchanged). */
 function escapeHtml(text) {
-  return text.replace(/[&<>"']/g, (c) => ESCAPES[c]);
+  if (text.length > 2048) return escapeHtmlRaw(text);
+  const hit = escCache.get(text);
+  if (hit !== undefined) return hit;
+  const out = escapeHtmlRaw(text);
+  escCache.set(text, out);
+  return out;
 }
 
 export const SLUG_MAX = 64;
@@ -389,10 +416,19 @@ function lex(src) {
 /** The characters a backslash escapes. */
 const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']);
 
+// The same set as a table over code units (all its members are ASCII), for the scanning loops.
+const ESCAPABLE_TABLE = new Uint8Array(128);
+for (const ch of ESCAPABLE) ESCAPABLE_TABLE[ch.charCodeAt(0)] = 1;
+
+/** Whether `cc` is a character a backslash escapes. */
+function isEscapable(cc) {
+  return cc < 128 && ESCAPABLE_TABLE[cc] === 1;
+}
+
 /** The first index from `from` where `s` holds `what` outside a backslash escape, or -1. */
 function findUnescaped(s, what, from) {
   for (let j = from; j <= s.length - what.length; j++) {
-    if (s[j] === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
+    if (s[j] === '\\' && j + 1 < s.length && isEscapable(s.charCodeAt(j + 1))) {
       j++;
       continue;
     }
@@ -405,7 +441,7 @@ function findUnescaped(s, what, from) {
 function findSingleStar(s, from) {
   for (let j = from; j < s.length; j++) {
     const c = s[j];
-    if (c === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
+    if (c === '\\' && j + 1 < s.length && isEscapable(s.charCodeAt(j + 1))) {
       j++;
       continue;
     }
@@ -419,9 +455,15 @@ function findSingleStar(s, from) {
   return -1;
 }
 
+// Shared scan regexes (module level: each use sets lastIndex and runs to completion, and none is
+// re-entered while a scan is live, so sharing the object is safe).
+const ESC_SCAN = /[&<>"']/g;
+const CONSTRUCT_SCAN = /[`*\[\\]/g;
+
 /** `str` HTML-escaped into the chunk list `out` (slices between specials, never a call per character). */
 function escapeInto(out, str) {
-  const re = /[&<>"']/g;
+  const re = ESC_SCAN;
+  re.lastIndex = 0;
   let last = 0;
   let m;
   while ((m = re.exec(str)) !== null) {
@@ -440,7 +482,7 @@ function inline(s, env) {
   const n = s.length;
   while (i < n) {
     const c = s[i];
-    if (c === '\\' && i + 1 < n && ESCAPABLE.has(s[i + 1])) {
+    if (c === '\\' && i + 1 < n && isEscapable(s.charCodeAt(i + 1))) {
       const e = s[i + 1];
       out.push(ESCAPES[e] ?? e);
       i += 2;
@@ -497,17 +539,14 @@ function inline(s, env) {
     // A plain run: everything up to the next character that can open a construct
     // (a backslash counts only before an escapable character, as in the reference).
     let end = n;
-    for (const ch of ['`', '*', '[']) {
-      const k = s.indexOf(ch, i + 1);
-      if (k !== -1 && k < end) end = k;
-    }
-    let bs = s.indexOf('\\', i + 1);
-    while (bs !== -1 && bs < end) {
-      if (bs + 1 < n && ESCAPABLE.has(s[bs + 1])) {
-        end = bs;
+    const scan = CONSTRUCT_SCAN;
+    scan.lastIndex = i + 1;
+    let m;
+    while ((m = scan.exec(s)) !== null) {
+      if (m[0] !== '\\' || (m.index + 1 < n && isEscapable(s.charCodeAt(m.index + 1)))) {
+        end = m.index;
         break;
       }
-      bs = s.indexOf('\\', bs + 1);
     }
     escapeInto(out, s.slice(i, end));
     i = end;
@@ -698,6 +737,78 @@ function truthy(v) {
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
 }
 
+/** An include from compiled code: the named template rendered in `scope`, or "" where it did not parse. */
+function includeCompiled(ctx, name, scope, depth) {
+  const f = ctx.compiled.get(name);
+  if (f !== undefined) return f(scope, ctx, depth);
+  const nodes = ctx.templates.get(name);
+  return nodes === undefined ? '' : renderNodes(nodes, scope, ctx, depth);
+}
+
+/**
+ * A template's nodes compiled to a straight-line render function (the interpreter below is the
+ * fallback for anything codegen refuses). Paths are collected into a table the generated code
+ * indexes; scope variables are numbered so nested loops never shadow a name the code still uses.
+ */
+function compileTemplate(nodes) {
+  const paths = [];
+  let uid = 0;
+  const lines = [];
+  const emit = (nodes, scopeVar) => {
+    for (const n of nodes) {
+      switch (n.kind) {
+        case 'text':
+          if (n.text !== '') lines.push(`o+=${JSON.stringify(n.text)};`);
+          break;
+        case 'var':
+          paths.push(n.path);
+          lines.push(`o+=E(T(L(${scopeVar},P[${paths.length - 1}])));`);
+          break;
+        case 'raw':
+          paths.push(n.path);
+          lines.push(`o+=T(L(${scopeVar},P[${paths.length - 1}]));`);
+          break;
+        case 'if': {
+          paths.push(n.path);
+          const cond = `Y(L(${scopeVar},P[${paths.length - 1}]))!==${n.not}`;
+          if (n.else !== null) {
+            lines.push(`if(${cond}){`);
+            emit(n.then, scopeVar);
+            lines.push('}else{');
+            emit(n.else, scopeVar);
+            lines.push('}');
+          } else {
+            lines.push(`if(${cond}){`);
+            emit(n.then, scopeVar);
+            lines.push('}');
+          }
+          break;
+        }
+        case 'for': {
+          paths.push(n.path);
+          const id = uid++;
+          const xs = `x${id}`;
+          const j = `j${id}`;
+          const len = `n${id}`;
+          const child = `s${id}`;
+          lines.push(`{const ${xs}=L(${scopeVar},P[${paths.length - 1}]);if(Array.isArray(${xs})){const ${len}=${xs}.length;for(let ${j}=0;${j}<${len};${j}++){const ${child}={vars:{[${JSON.stringify(n.name)}]:${xs}[${j}],loop:{index:${j}+1,first:${j}===0,last:${j}===${len}-1,length:${len}}},parent:${scopeVar}};`);
+          emit(n.body, child);
+          lines.push('}}}');
+          break;
+        }
+        case 'include':
+          lines.push(`if(depth<${INCLUDE_DEPTH})o+=I(ctx,${JSON.stringify(n.name)},${scopeVar},depth+1);`);
+          break;
+        default:
+          throw new Error(`codegen: unknown node kind ${n.kind}`);
+      }
+    }
+  };
+  emit(nodes, 'scope');
+  const maker = new Function('L', 'T', 'Y', 'E', 'I', 'P', `return function(scope,ctx,depth){let o='';${lines.join('')}return o;};`);
+  return maker(lookup, textOf, truthy, escapeHtml, includeCompiled, paths);
+}
+
 /**
  * `nodes` rendered in `scope` ({ vars, parent }). `ctx` holds the parsed templates (`templates`, a Map of name to
  * nodes, a template that did not parse absent), the HTML escape and the include depth.
@@ -748,11 +859,21 @@ export const RESERVED = Object.freeze(['posts', 'tags', 'page']);
 /** Code-unit order (never the locale's). */
 const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
+// \s as a table over all code units, built once from isSpaceCode (the exact set above).
+const WS_TABLE = new Uint8Array(65536);
+for (let i = 0; i < 65536; i++) WS_TABLE[i] = isSpaceCode(i) ? 1 : 0;
+
 /** The words of a body: its runs of characters other than whitespace (counted, never listed). */
 function wordsOf(text) {
-  const re = /\S+/g;
   let count = 0;
-  while (re.exec(text) !== null) count++;
+  let inWord = false;
+  for (let i = 0; i < text.length; i++) {
+    if (WS_TABLE[text.charCodeAt(i)] === 1) inWord = false;
+    else if (!inWord) {
+      count++;
+      inWord = true;
+    }
+  }
   return count;
 }
 
@@ -849,17 +970,21 @@ function hasScheme(target) {
 /** 4. Each body's Markdown, its links resolved to the pages and static files they name. */
 function markdown(b) {
   const staticPaths = new Set(b.statics.map((f) => f.path));
+  // Resolutions repeat across sources in the same directory (every post links the same targets):
+  // successful resolutions are cached for the whole build, keyed by directory and target. Broken
+  // links are not cached: each source that holds one adds its own line to the report.
+  const linkCache = new Map();
   for (const s of b.sources) {
     const dir = dirOf(s.path);
     const dirParts = dir === '' ? [] : dir.split('/');
-    const linkCache = new Map();
     const env = {
       link: (target) => {
-        const hit = linkCache.get(target);
+        const key = `${dir}\n${target}`;
+        const hit = linkCache.get(key);
         if (hit !== undefined) return hit;
         let out;
         if (hasScheme(target) || target.startsWith('/') || target.startsWith('#')) {
-          linkCache.set(target, target);
+          linkCache.set(key, target);
           return target;
         }
         const hash = target.indexOf('#');
@@ -873,9 +998,9 @@ function markdown(b) {
         }
         if (out === undefined) {
           b.broken.add(`broken-link ${s.path} -> ${target}`);
-          out = target;
+          return target;
         }
-        linkCache.set(target, out);
+        linkCache.set(key, out);
         return out;
       },
     };
@@ -967,7 +1092,9 @@ function pageOf(b, s) {
     ...cardOf(b, s),
     slug: s.slug,
     content: s.html,
-    toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
+    // The toc entries already hold exactly { level, id, html } and templates only read them:
+    // share the array instead of copying it for every page.
+    toc: s.toc,
     newer: linkOf(b, s.newer ?? null),
     older: linkOf(b, s.older ?? null),
     is_post: s.post,
@@ -980,10 +1107,13 @@ function layouts(b) {
   const site = { title: b.input.site.title, base_url: b.base };
   const allTags = b.tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = b.posts.slice(0, b.input.site.recent).map((p) => b.cards.get(p));
-  const ctx = { templates: b.templates, escape: escapeHtml };
+  const ctx = { templates: b.templates, compiled: b.compiled, escape: escapeHtml };
   const render = (name, vars) => {
+    const scope = { vars: { site, tags: allTags, recent, ...vars }, parent: null };
+    const fn = b.compiled.get(name);
+    if (fn !== undefined) return fn(scope, ctx, 0);
     const nodes = b.templates.get(name);
-    return nodes === undefined ? null : renderNodes(nodes, { vars: { site, tags: allTags, recent, ...vars }, parent: null }, ctx, 0);
+    return nodes === undefined ? null : renderNodes(nodes, scope, ctx, 0);
   };
   for (const s of b.sources) b.output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(b, s) });
   const per = b.input.site.per_page;
@@ -1020,6 +1150,7 @@ function report(b) {
 export function build(input) {
   slugCache = new Map();
   dateCache = new Map();
+  escCache = new Map();
   const templates = new Map();
   const reportLines = [];
   for (const name of Object.keys(input.templates).sort(byCodeUnits)) {
@@ -1030,10 +1161,19 @@ export function build(input) {
       reportLines.push(err.message);
     }
   }
+  const compiled = new Map();
+  for (const [name, nodes] of templates) {
+    try {
+      compiled.set(name, compileTemplate(nodes));
+    } catch {
+      // Codegen refused this template's shape: the interpreter renders it instead.
+    }
+  }
   const b = {
     input,
     base: input.site.base_url.replace(/\/+$/, ''),
     templates,
+    compiled,
     sources: [],
     statics: [],
     bySource: new Map(),
